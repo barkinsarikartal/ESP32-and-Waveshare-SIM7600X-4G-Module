@@ -31,8 +31,8 @@
 #define TINY_GSM_MODEM_SIM7600
 #define UART_BAUD 115200
 #define SerialAT Serial1
-#define MODEM_TX 16 // Connect SIM Module's TX pin to ESP32's GPIO16
-#define MODEM_RX 15 // Connect SIM Module's RX pin to ESP32's GPIO15
+#define MODEM_TX 16 // Connect SIM Module's RX pin to ESP32's GPIO16
+#define MODEM_RX 15 // Connect SIM Module's TX pin to ESP32's GPIO15
 
 #include <ArduinoHttpClient.h>  // Version 0.6.0, by Arduino
 #include <SoftwareSerial.h>     // Comes with Arduino IDE
