@@ -1,5 +1,5 @@
-# ESP32 and Waveshare SIM7600X 4G Module GPRS Examples
-This repository contains GPRS examples for ESP32 and Waveshare's SIM7600X 4G Module.
+# ESP32 and Waveshare SIM7600X 4G Module GPRS and GNSS Examples
+This repository contains GPRS and GNSS examples for ESP32 and Waveshare's SIM7600X 4G Module.
 
 ## Modules Used
 - ESP32-S3-DevKitC-1 (N16R8)

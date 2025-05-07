@@ -1,9 +1,9 @@
 /**
  * ============================================================================
- * ESP32 OTA Updates over GPRS with SIM7600X 4G Module
+ * ESP32 OTA Updates over GPRS with Chunked Transfer Encoding
  * ============================================================================
  * 
- * @project    Performing OTA over GPRS
+ * @project    Performing OTA Over GPRS Using Chunked Transfer Encoding
  * @author     Barkın Sarıkartal
  * @date       April 26, 2025
  * @license    MIT License
@@ -13,9 +13,12 @@
  *   This project enables Over-The-Air (OTA) firmware updates for ESP32-S3-DevKitC-1
  *   using cellular GPRS connectivity via the Waveshare SIM7600X 4G Module,
  *   eliminating the need for WiFi connectivity.
- *   
+ * 
  *   The code downloads bin files from a remote server using GPRS and stores them
- *   in SPIFFS before applying the firmware update.
+ *   in SPIFFS before applying the firmware update.  
+ *
+ *   The implementation specifically handles chunked transfer encoding from HTTP
+ *   servers that don't provide Content-Length headers.
  * 
  * @hardware
  *   - ESP32-S3-DevKitC-1 N16R8 (16MB Flash, 8MB PSRAM)
@@ -27,10 +30,16 @@
  *   - ESP32 Board Package v3.0.1
  * 
  * @notes
- *   IMPORTANT: This implementation supports servers that respond with the HTTP header
- *   "Content-Length". For servers that use "Transfer-Encoding: Chunked" header, please use
- *   the alternative implementations (OTA_OVER_GPRS_CHUNKED.ino or OTA_OVER_GPRS_CHUNKED_CRC32.ino)
- *   in this repository.
+ *   IMPORTANT: This implementation is specific for servers that respond with the
+ *   HTTP header "Transfer-Encoding: Chunked". For servers that use standard
+ *   "Content-Length" headers, please use the alternative implementations
+ *   (OTA_OVER_GPRS.ino or OTA_OVER_GPRS_CRC32.ino) in this repository.
+ *   
+ *   Since chunked transfer encodings cannot include Content-Length headers,
+ *   this implementation verifies firmware integrity using a separate CRC32
+ *   checksum. The code fetches a JSON file from "yourserver.com/yourCRC32path"
+ *   containing the expected hash value (format: {"Hash": "d7c1c20a"}) and
+ *   compares it with the calculated hash of the downloaded file.
  *   
  *   A custom partition scheme is required: "8M with spiffs 3MB APP/1.5 MB SPIFFS"
  *   for optimal storage allocation between application and update files.
@@ -47,7 +56,9 @@
 // External Libraries
 #include <ArduinoHttpClient.h>  // Version 0.6.0, by Arduino
 #include <TinyGsmClient.h>      // Version 0.12.0, by Volodymyr Shymanskyy
+#include <ArduinoJson.h>        // Version 7.3.0, by Benoit Blanchon
 #include <SSLClient.h>          // Version 1.3.2, by V Govorovski, used for SSL connections
+#include <CRC32.h>              // Version 2.0.0, by Christopher Baker, used for calculating CRC32 value of bin file
 
 // Built-in Libraries
 #include <SoftwareSerial.h>     // Comes with Arduino IDE
@@ -61,10 +72,11 @@ const char user[] = "";
 const char pass[] = "";
 
 // Update Configuration
-const char* updateFileName = "/firmware.bin";   // File name on SPIFFS
-const char* server = "yourserver.com";          // Server hosting the bin file
-const char* fileAddressPath = "/yourbinfile";   // The specific path on the server where the bin file can be accessed
-// const char* bearerToken = "yourbearertoken"; // Uncomment if using a bearer token
+const char* updateFileName = "/firmware.bin";    // File name on SPIFFS
+const char* server = "yourserver.com";           // Server hosting the bin file
+const char* fileAddressPath = "/yourbinfile";    // The specific path on the server where the bin file can be accessed
+const char* crc32AddressPath = "/yourCRC32path"; // The specific path on the server where the CRC32 value of the bin file can be accessed
+// const char* bearerToken = "yourbearertoken";  // Uncomment if using a bearer token
 
 TinyGsm modem(SerialAT);
 TinyGsmClient client(modem);
@@ -73,7 +85,7 @@ SSLClient secure_layer(&client);
 void setup() {
   Serial.begin(115200);
   delay(10);
-  Serial.println("ESP32 OTA Updates over GPRS using SIM7600...");
+  Serial.println("ESP32 OTA Updates over GPRS using SIM7600 with Chunked Transfer...");
 
   // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
@@ -101,11 +113,32 @@ void setup() {
   // Execute OTA update sequence
   if (SIMStartFunction()) { // Connecting to GPRS
     Serial.println("--------------------");
+
+    // Step 1: Get expected CRC32 hash from server
+    String expectedCRC = GetOTACRC32();
+    if (expectedCRC.isEmpty()) {
+      Serial.println("Failed to obtain CRC32 checksum from server.");
+      return;
+    }
+
+    // Step 2: Download firmware binary
     if (FetchAndSaveBin()) {
-      if (PerformOTA()) {
-        SPIFFS.end(); // Close SPIFFS for safe restart
-        delay(2000);
-        ESP.restart(); // Restart ESP32 to boot with new bin file
+      Serial.println("Firmware binary downloaded.");
+
+      // Step 3: Verify firmware integrity
+      if (VerifyCRC(expectedCRC)) {
+        Serial.println("CRC32 verification passed.");
+
+        // Step 4: Perform OTA update
+        if (PerformOTA()) {
+          Serial.println("OTA update completed. Restarting...");
+          SPIFFS.end(); // Closing SPIFFS for safe restart
+          delay(2000);
+          ESP.restart(); // Restarting ESP32 to boot with new bin file
+        }
+      }
+      else {
+        Serial.println("CRC32 verification failed - downloaded file is corrupted.");
       }
     }
   }
@@ -160,20 +193,80 @@ bool SIMStartFunction() {
 }
 
 /**
- * Download firmware binary from server and save to SPIFFS
+ * Fetch CRC32 checksum from server
+ * 
+ * @return String containing CRC32 hash or empty string on error
+ */
+String GetOTACRC32() {
+  Serial.println("\nFetching CRC32 checksum from server...");
+  Serial.print("Endpoint: ");
+  Serial.println(String(server) + crc32AddressPath);
+
+  HttpClient crc32http(secure_layer, server, 443);
+  crc32http.beginRequest();
+  crc32http.get(crc32AddressPath);
+  // crc32http.sendHeader("Authorization", String("Bearer ") + bearerToken); // Uncomment if you are using a bearer token
+  crc32http.endRequest();
+  
+  // Check response status
+  int statusCode = crc32http.responseStatusCode();
+  Serial.print("HTTP Response: "); Serial.println(statusCode);
+  if (statusCode != 200) {
+    Serial.printf("HTTP GET failed with status code %d\n", statusCode);
+    crc32http.stop();
+    return "";
+  }
+
+  // Read response body
+  String payload = crc32http.responseBody();
+  if (payload.length() <= 0) {
+    Serial.println("ERROR: Empty response from server");
+    crc32http.stop();
+    return "";
+  }
+  
+  // Parse JSON response
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if (error) {
+    Serial.print("ERROR: JSON parsing failed - ");
+    Serial.println(error.c_str());
+    crc32http.stop();
+    return "";
+  }
+  
+  // Extract hash value
+  const char* hashValue = doc["Hash"];
+  if (!hashValue) {
+    Serial.println("ERROR: Missing 'Hash' field in JSON response");
+    crc32http.stop();
+    return "";
+  }
+  
+  String getHash = String(hashValue);
+  crc32http.stop();
+  
+  Serial.print("Server's CRC32 Value: ");
+  Serial.println(getHash);
+  return getHash;
+}
+
+/**
+ * Download firmware binary from server using chunked transfer encoding
  * 
  * @return true if download successful, false otherwise
  */
 bool FetchAndSaveBin() {
-  Serial.println("\nAttempting to download firmware update...");
-  Serial.print("Connecting to: ");
-  Serial.println(server);
+  Serial.println("\nDownloading firmware binary...");
+  Serial.print("Endpoint: ");
+  Serial.println(String(server) + fileAddressPath);
 
   // Initialize HTTP connection
   HttpClient http(secure_layer, server, 443);
   http.beginRequest();
   http.get(fileAddressPath);
-  // http.sendHeader("Authorization", String("Bearer ") + bearerToken);  // Uncomment if using a bearer token
+  // http.sendHeader("Authorization", String("Bearer ") + bearerToken);  // Uncomment if you are using a bearer token
   http.endRequest();
 
   int httpCode = http.responseStatusCode();
@@ -183,75 +276,135 @@ bool FetchAndSaveBin() {
     return false;
   }
 
-  // Verify content length
-  int contentLength = http.contentLength();
-  if (contentLength <= 0) {
-    Serial.printf("Invalid Content Length: %d.\n", contentLength);
-    http.stop();
-    return false;
+  // Chunked control
+  String chunkedVal = GetHeaderValue(http, HTTP_HEADER_TRANSFER_ENCODING);
+  if (chunkedVal != HTTP_HEADER_VALUE_CHUNKED) {
+    Serial.println("Warning: Data is not using chunked transfer encoding.");
   }
-  Serial.print("Expected Firmware Size: "); Serial.println(contentLength);
+  else {
+    Serial.println("Using chunked transfer encoding.");
+  }
+
+  // Skip remaining headers
+  http.skipResponseHeaders();
 
   // Open file for writing
   File file = SPIFFS.open(updateFileName, FILE_WRITE);
   if (!file) {
-    Serial.println("Couldn't Open SPIFFS File to Write..");
+    Serial.println("Failed to Open SPIFFS File to Write..");
     http.stop();
     return false;
   }
 
   // Download file
   Serial.println("Downloading firmware...");
-  const int bufferSize = 1024;
-  uint8_t buffer[bufferSize];
   unsigned long timeout = millis();
-  int bytesRead = 0;
-  int progressCounter = 0;
+  int totalBytes = 0, progressCounter = 0;;
 
   // Loop until download complete or error
   while (!http.endOfBodyReached() && http.connected()) {
     if (http.available()) {
-      int readSize = http.read(buffer, sizeof(buffer));
-      if (readSize > 0) {
-        file.write(buffer, readSize);
-        bytesRead += readSize;
+      char buffer[128];
+      int bytesRead = http.readBytes(buffer, sizeof(buffer));
+
+      if (bytesRead > 0) {
+        file.write((uint8_t*)buffer, bytesRead);
+        totalBytes += bytesRead;
         timeout = millis();
 
         // Show progress periodically
-        if (++progressCounter % 8 == 0 || bytesRead == contentLength) {
-          float progress = (float)bytesRead / contentLength * 100;
-          Serial.printf("Download progress: %d bytes (%.1f%%)\n", bytesRead, progress);
+        if (++progressCounter % 40 == 0) {
+          Serial.printf("Download progress: %d bytes\n", totalBytes);
         }
       }
-      else {
-        break; // No more data
-      }
-      delay(10);
     }
-    if (millis() - timeout > 30000) { // Check for timeout
+    
+    if (millis() - timeout > 30000) {
       Serial.println("Timeout error!");
       file.close();
       http.stop();
       SPIFFS.remove(updateFileName);
       return false;
     }
+
+    delay(10);
   }
 
   // Close file and connection
   file.close();
   http.stop();
 
-  // Verify downloaded file size
+  // Check download success
   Serial.println("\nDownload completed");
-  Serial.printf("Expected size: %d bytes\n", contentLength);
-  Serial.printf("Actual size:   %d bytes\n", bytesRead);
+  Serial.printf("Total downloaded: %d bytes\n", totalBytes);
 
-  if (bytesRead == 0 || bytesRead != contentLength) {
-    Serial.println("Incomplete download.");
+  if (totalBytes == 0) {
+    Serial.println("No data downloaded.");
     SPIFFS.remove(updateFileName);
     return false;
   }
+
   return true;
+}
+
+/**
+ * Helper function to extract specific HTTP header value
+ * 
+ * @param client      HTTP client object
+ * @param headerName  Name of header to find
+ * @return            Value of header or empty string if not found
+ */
+String GetHeaderValue(HttpClient& client, const char* headerName) {
+  while (client.headerAvailable()) {
+    String name = client.readHeaderName();
+    if (name.equalsIgnoreCase(headerName)) {
+      return client.readHeaderValue();
+    }
+    client.readHeaderValue();
+  }
+  return "";
+}
+
+/**
+ * Verify downloaded file using CRC32 checksum
+ * 
+ * @param expected  Expected CRC32 value from server
+ * @return          true if checksums match, false otherwise
+ */
+bool VerifyCRC(String expected) {
+  Serial.println("\nVerifying firmware integrity...");
+
+  // Open downloaded file in binary reading mode
+  File file = SPIFFS.open(updateFileName, "rb");
+  if (!file) {
+    Serial.println("Failed to open firmware file for verification.");
+    return false;
+  }
+
+  // Calculate CRC32 of downloaded file
+  CRC32 crc;
+  uint8_t buffer[512];
+  size_t bytesRead;
+  unsigned long totalBytesRead = 0;
+
+  Serial.println("Calculating CRC32...");
+  while ((bytesRead = file.read(buffer, sizeof(buffer))) > 0) {
+    crc.update(buffer, bytesRead);
+    totalBytesRead += bytesRead;
+  }
+
+  // Finalize CRC calculation
+  uint32_t crcValue = crc.finalize();
+  char crcHexString[9]; // 8 characters + null terminator
+  sprintf(crcHexString, "%08x", crcValue);
+  String crcString = String(crcHexString);
+
+  file.close();
+
+  Serial.printf("Processed %lu bytes for CRC calculation\n", totalBytesRead);
+  Serial.print("Expected CRC32: " + crcString + ", Calculated: " + expected);
+  
+  return crcString == expected;
 }
 
 /**
@@ -326,7 +479,5 @@ bool PerformOTA() {
     Serial.println("Failed to set boot partition.");
     return false;
   }
-
-  Serial.println("OTA update successfully applied.");
   return true;
 }
